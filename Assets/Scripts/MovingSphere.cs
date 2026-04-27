@@ -1,3 +1,4 @@
+using Unity.VisualScripting;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
@@ -9,38 +10,97 @@ public class MovingSphere : MonoBehaviour
 
     [SerializeField, Range(0f, 100f)]
     private float maxSpeed = 10f;
-    private Vector3 velocity;
+    private Vector3 velocity, desiredVelocity;
 
     [SerializeField, Range(0f, 100f)]
     private float maxAcceleration = 10f;
+    private Rigidbody body;
 
-    [SerializeField]
-    // Instead of binding the player to the plane directly, we define their roam area through this property
-    private Rect allowedArea = new Rect(-4.5f, -4.5f, 9f, 9f);
+    // Jumping
+    [SerializeField, Range(0f, 10f)]
+    private float jumpHeight = 2f;
+    private bool desiredJump;
+    private InputAction jumpAction;
+    private int groundContactCount;
+    private bool OnGround => groundContactCount > 0;
+    [SerializeField, Range(0, 5)]
+    private int maxAirJumps = 0;
+    private int jumpPhase;
+    [SerializeField, Range(0f, 100f)]
+    [Tooltip("0 - no control, 100 - total control")]
+    private float maxAirAcceleration = 1f;
+    
+    
+    // Slopes
+    [SerializeField, Range(0f, 90f)]
+    private float maxGroundAngle = 25f;
+    private float minGroundDotProduct;
+    private Vector3 contactNormal;
 
-    [SerializeField, Range(0f, 1f)]
-    [Tooltip("What part of the velocity should be reversed when colliding with wall")]
-	float bounciness = 0.5f;
+    void OnValidate()
+    {
+        // Mathf expects it in radians
+        minGroundDotProduct = Mathf.Cos(maxGroundAngle * Mathf.Deg2Rad);
+    }
+
 
     void Awake()
     {
         moveAction = inputActions["Move"];
+        jumpAction = inputActions["Jump"];
+
         moveAction.Enable();
+        jumpAction.Enable();
+
+
+        body = GetComponent<Rigidbody>();
+
+        OnValidate(); // Invoke it here so it gets calculated in builds
     }
 
     void OnEnable()
     {
-        moveAction.Enable();        
+        moveAction.Enable();
+        jumpAction.Enable();        
     }
 
     void OnDisable()
     {
         moveAction.Disable();
+        jumpAction.Disable();
+    }
+
+    void OnCollisionStay(Collision collision)
+    {
+        EvaluateCollision(collision);
+    }
+
+    void OnCollisionEnter(Collision collision)
+    {
+        EvaluateCollision(collision);
+    }
+
+    void EvaluateCollision(Collision collision)
+    {
+        // contactCount property tells how many contact points there are
+        for (int i = 0; i < collision.contactCount; i++)
+        {
+            Vector3 normal = collision.GetContact(i).normal; // Get the direction that the sphere should be pushed
+
+            // onGround |= normal.y >= minGroundDotProduct;
+            if (normal.y >= minGroundDotProduct)
+            {
+                groundContactCount += 1;
+                contactNormal += normal; // keep track of the normal of the object that the ball is on
+            }
+        }
     }
 
     void Update()
     {
         Vector2 playerInput = moveAction.ReadValue<Vector2>();
+        // ORed with itself in case the FixedUpdate doesn't occur this frame. That way it's not forgotten
+        desiredJump |= jumpAction.triggered; // ReadValue reads only a float?
 
         /* The maximum speed when moving with a keyboard is sqrt(2),
         so we normalize it so that it doesn't exceed 1.
@@ -56,53 +116,93 @@ public class MovingSphere : MonoBehaviour
         */
 
         // Determine which direction the player wants to move in
-        Vector3 desiredVelocity = new Vector3(playerInput.x, 0f, playerInput.y) * maxSpeed;
-
-        // Define by how much we're able to change the velocity this update
-        float maxSpeedChange = maxAcceleration * Time.deltaTime;
-
-        // Adjust the velocity by the maxSpeedChange amount and ensure the change does not exceed the maxSpeedChange
-        velocity.x = Mathf.MoveTowards(velocity.x, desiredVelocity.x, maxSpeedChange);
-        velocity.z = Mathf.MoveTowards(velocity.z, desiredVelocity.z, maxSpeedChange);
-
-        Vector3 displacement = velocity * Time.deltaTime;
+        desiredVelocity = new Vector3(playerInput.x, 0f, playerInput.y) * maxSpeed;
         
-        // transform.localPosition += displacement; // This works but player can go anywhere
+    }
 
-        Vector3 newPosition = transform.localPosition + displacement;
-        /* Whenever a ball "collides" with an edge, the velocity doesn't change, it's just bound
-        No bueno
-        if (!allowedArea.Contains(new Vector2(newPosition.x, newPosition.z))) // Check whether the newPosition is not within the constraints
+    void FixedUpdate()
+    {
+        UpdateState();
+
+        AdjustVelocity();
+
+        if (desiredJump)
         {
-            // newPosition = transform.localPosition; // This ignores all movement even if one of the directions is within bounds
-            newPosition.x = Mathf.Clamp(newPosition.x, allowedArea.xMin, allowedArea.xMax);
-            newPosition.z = Mathf.Clamp(newPosition.z, allowedArea.yMin, allowedArea.yMax);
+            desiredJump = false;
+            Jump();
         }
-        */
 
-        // Actually stop the ball from moving in the according direciton when encountering a "wall"
-        if (newPosition.x < allowedArea.xMin) {
-			newPosition.x = allowedArea.xMin;
-			// velocity.x = 0f; // This works, but let's make it bounce
-            velocity.x = -velocity.x * bounciness;
-		}
-		else if (newPosition.x > allowedArea.xMax) {
-			newPosition.x = allowedArea.xMax;
-			// velocity.x = 0f; // This works, but let's make it bounce
-            velocity.x = -velocity.x * bounciness;
-		}
-		if (newPosition.z < allowedArea.yMin) {
-			newPosition.z = allowedArea.yMin;
-			// velocity.z = 0f; // This works, but let's make it bounce
-            velocity.z = -velocity.z * bounciness;
-		}
-		else if (newPosition.z > allowedArea.yMax) {
-			newPosition.z = allowedArea.yMax;
-			// velocity.z = 0f; // This works, but let's make it bounce
-            velocity.z = -velocity.z * bounciness;
-		}
+        body.linearVelocity = velocity;
 
-        transform.localPosition = newPosition;
-        
+        ClearState();
+    }
+
+    void Jump()
+    {
+        if (OnGround || jumpPhase < maxAirJumps)
+        {
+            jumpPhase += 1;
+            
+            float jumpSpeed = Mathf.Sqrt(-2f * Physics.gravity.y * jumpHeight);
+
+            float alignedSpeed = Vector3.Dot(velocity, contactNormal);
+
+            // Limit the amount of upward speed if we already have some
+            if (alignedSpeed > 0f)
+            {
+                // So that we don't slow down if we're already going faster than the jump speed
+                jumpSpeed = Mathf.Max(jumpSpeed - alignedSpeed, 0f);
+            }
+            velocity += contactNormal * jumpSpeed;
+        }
+    }
+
+    void UpdateState()
+    {
+        // Physics collisions also affect velocity, so retrieve it before adjusting it to match the desired velocity
+        velocity = body.linearVelocity;
+        if (OnGround)
+        {
+            jumpPhase = 0;
+            if (groundContactCount > 1)
+            {
+                contactNormal.Normalize();
+            }
+        }
+        else
+        {
+            contactNormal = Vector3.up;
+        }
+    }
+
+    Vector3 ProjectOnContactPlane (Vector3 vector)
+    {
+        return vector - contactNormal * Vector3.Dot(vector, contactNormal);
+    }
+
+    void AdjustVelocity()
+    {
+        Vector3 xAxis = ProjectOnContactPlane(Vector3.right).normalized;
+        Vector3 zAxis = ProjectOnContactPlane(Vector3.forward).normalized;
+
+        // Project the current velocity on both vectors
+        float currentX = Vector3.Dot(velocity, xAxis);
+        float currentZ = Vector3.Dot(velocity, zAxis);
+
+        float acceleration = OnGround ? maxAcceleration : maxAirAcceleration;
+        float maxSpeedChange = acceleration * Time.deltaTime;
+
+        // Calculate the new X and Z speeds relative to the ground
+        float newX = Mathf.MoveTowards(currentX, desiredVelocity.x, maxSpeedChange);
+        float newZ = Mathf.MoveTowards(currentZ, desiredVelocity.z, maxSpeedChange);
+
+        // Adjust the velocity by adding the differences between the new and old speeds along the relative axes
+        velocity += xAxis * (newX - currentX) + zAxis * (newZ - currentZ);
+    }
+
+    void ClearState()
+    {
+        groundContactCount = 0;
+        contactNormal = Vector3.zero;
     }
 }
